@@ -14,7 +14,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 import config
 from input_validator import validate_login_payload
-from rate_limiter import block_ip, get_blocked_ips, is_allowed
+from rate_limiter import block_ip, clear_failed_logins, get_blocked_ips, is_allowed, record_failed_login
 from security_headers import init_security_headers
 from security_logger import Event, security_logger
 from session_manager import session_manager
@@ -90,39 +90,34 @@ CORS(
 init_security_headers(app)
 
 ADMIN_PASSWORD_HASH = _admin_password_hash()
+camera_lock = threading.Lock()
+camera = None
 
-# --- BACKGROUND THREAD BROADCAST LOGIC ---
-latest_frame = None
-frame_lock = threading.Lock()
 
-def camera_background_thread():
-    """Continuously reads the camera from a single thread and stores the latest frame."""
-    global latest_frame
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY]
-    
+def _open_camera():
     cap = cv2.VideoCapture(_camera_source(), _camera_backend())
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
+    return cap
 
-    while True:
-        if not cap.isOpened():
-            time.sleep(2)
-            cap.open(_camera_source(), _camera_backend())
-            continue
 
-        success, frame = cap.read()
-        if success:
-            ok, buffer = cv2.imencode(".jpg", frame, encode_params)
-            if ok:
-                with frame_lock:
-                    latest_frame = buffer.tobytes()
-        else:
-            time.sleep(1)
-            cap.release()
-            cap.open(_camera_source(), _camera_backend())
+def _get_camera():
+    global camera
+    with camera_lock:
+        if camera is None or not camera.isOpened():
+            if camera is not None:
+                camera.release()
+            camera = _open_camera()
+        return camera
 
-# Start the worker thread
-threading.Thread(target=camera_background_thread, daemon=True).start()
+
+def _reopen_camera():
+    global camera
+    with camera_lock:
+        if camera is not None:
+            camera.release()
+        camera = _open_camera()
+        return camera
 
 
 @app.route("/")
@@ -131,17 +126,26 @@ def index():
 
 
 def generate_frames():
-    """Serves the globally buffered frame to connected clients."""
-    global latest_frame
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY]
+    failures = 0
     while True:
-        with frame_lock:
-            current_frame = latest_frame
-        if current_frame:
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + current_frame + b"\r\n"
-            )
-        time.sleep(0.05)  # Caps stream delivery at ~20 frames per second
+        cap = _get_camera()
+        success, frame = cap.read()
+        if not success:
+            failures += 1
+            if failures >= 3:
+                _reopen_camera()
+                failures = 0
+            time.sleep(1)
+            continue
+        failures = 0
+        ok, buffer = cv2.imencode(".jpg", frame, encode_params)
+        if not ok:
+            continue
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+        )
 
 
 @app.route("/video_feed")
@@ -189,9 +193,19 @@ def login():
     )
 
     if not is_valid:
-        security_logger.log(Event.LOGIN_FAILURE, ip=client, username=clean_user)
+        blocked_now, failed_count = record_failed_login(client)
+        event = Event.BRUTE_FORCE if blocked_now else Event.LOGIN_FAILURE
+        security_logger.log(
+            event,
+            ip=client,
+            username=clean_user,
+            extra={"failed_attempts": failed_count},
+        )
+        if blocked_now:
+            return jsonify({"success": False, "message": "Too many failed attempts. Try again later."}), 429
         return jsonify({"success": False, "message": "Invalid credentials."}), 401
 
+    clear_failed_logins(client)
     token = session_manager.create_session(ip=client, username=clean_user)
     if token is None:
         return jsonify({"success": False, "message": "Server session limit reached."}), 503
@@ -249,7 +263,8 @@ def health():
     source = str(config.CAMERA_SOURCE)
     parsed = urlparse(source)
     source_type = "remote" if parsed.scheme else "local"
-    return jsonify({"status": "ok", "camera": latest_frame is not None, "source": source_type})
+    cap = _get_camera()
+    return jsonify({"status": "ok", "camera": cap.isOpened(), "source": source_type})
 
 
 if __name__ == "__main__":
