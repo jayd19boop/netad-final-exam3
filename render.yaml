@@ -5,6 +5,10 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120
     envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: dcol-db
+          property: connectionString
       - key: DCOL_DEBUG
         value: "false"
       - key: DCOL_SESSION_COOKIE_SECURE
@@ -19,3 +23,7 @@ services:
         generateValue: true
       - key: DCOL_CAMERA_SOURCE
         sync: false
+
+databases:
+  - name: dcol-db
+    plan: free
