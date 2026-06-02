@@ -1,6 +1,7 @@
-"""DCOL secure surveillance backend with PostgreSQL database integration."""
+"""DCOL secure surveillance backend with complete PostgreSQL persistence."""
 
 import os
+import secrets
 import threading
 import time
 from functools import wraps
@@ -50,43 +51,13 @@ def _is_allowed_origin() -> bool:
     return origin in config.ALLOWED_ORIGINS
 
 
-def require_session(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if not _is_allowed_origin():
-            abort(403)
-
-        token = _session_token()
-        client = _client_ip()
-        bound_ip = client if config.SESSION_BIND_IP else None
-        if not session_manager.validate(token, ip=bound_ip):
-            log_security_event(Event.TOKEN_INVALID, ip=client)
-            abort(403)
-        return view(*args, **kwargs)
-
-    return wrapped
-
-
-def _admin_password_hash() -> str:
-    if config.ADMIN_PASSWORD_HASH:
-        return config.ADMIN_PASSWORD_HASH
-    if config.DEBUG and config.ADMIN_PASSWORD:
-        return generate_password_hash(config.ADMIN_PASSWORD)
-    raise RuntimeError(
-        "Set DCOL_ADMIN_PASSWORD_HASH in Render. "
-        "Generate one locally with: python -c \"from werkzeug.security import "
-        "generate_password_hash; print(generate_password_hash('your-password'))\""
-    )
-
-
 app = Flask(__name__, static_folder=None)
 app.secret_key = config.SECRET_KEY or os.urandom(32)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-# ── POSTGRESQL CONFIGURATION & DATABASE MODELS ───────────────────────────────
+# ── POSTGRESQL LAYER & SCHEMAS ────────────────────────────────────────────────
 db_url = config.DATABASE_URL
 if db_url:
-    # Safely convert old dialect strings to SQLAlchemy 1.4+ standards
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
 else:
@@ -98,7 +69,7 @@ db = SQLAlchemy(app)
 
 
 class DBLog(db.Model):
-    """PostgreSQL Schema mirroring audit events for persistent collection."""
+    """Schema for persistent Security Access Logs."""
     __tablename__ = "security_events"
     id = db.Column(db.Integer, primary_key=True)
     time = db.Column(db.String(20), nullable=False)
@@ -110,12 +81,32 @@ class DBLog(db.Model):
     is_threat = db.Column(db.Boolean, default=False)
 
 
+class DBSession(db.Model):
+    """Schema for persistent Active Sessions."""
+    __tablename__ = "active_sessions"
+    id = db.Column(db.Integer, primary_key=True)
+    token = db.Column(db.String(64), unique=True, nullable=False)
+    ip = db.Column(db.String(45), nullable=False)
+    username = db.Column(db.String(50), nullable=False)
+    created_at = db.Column(db.Float, nullable=False, default=time.time)
+    last_seen = db.Column(db.Float, nullable=False, default=time.time)
+    revoked = db.Column(db.Boolean, default=False)
+
+
+class DBBlockedIP(db.Model):
+    """Schema for persistent Blocked IPs."""
+    __tablename__ = "blocked_ips"
+    id = db.Column(db.Integer, primary_key=True)
+    ip = db.Column(db.String(45), unique=True, nullable=False)
+    blocked_at = db.Column(db.Float, nullable=False, default=time.time)
+    unblock_at = db.Column(db.Float, nullable=False)
+
+
+# ── DATABASE OPERATION HELPERS ───────────────────────────────────────────────
+
 def log_security_event(event_type: str, ip: str, username: str = None, extra: dict = None):
-    """Dispatches logging events directly to file structures and PostgreSQL."""
-    # Write to local memory buffers/files first
+    """Logs security actions simultaneously to files and the database."""
     entry = security_logger.log(event_type, ip, username=username, extra=extra)
-    
-    # Mirror persistently to database layer
     try:
         db_entry = DBLog(
             time=entry.get("time", ""),
@@ -129,14 +120,97 @@ def log_security_event(event_type: str, ip: str, username: str = None, extra: di
         db.session.add(db_entry)
         db.session.commit()
     except Exception as e:
-        print(f"[DATABASE ERROR] Logging mirroring connection dropped: {e}", flush=True)
+        print(f"[DB ERROR] Failed to record security event: {e}", flush=True)
         db.session.rollback()
 
 
-# Automatically initialize tables inside the database context during instantiation
+def _validate_db_session(token: str, client_ip: str = None) -> bool:
+    """Validates session structures directly against database targets."""
+    if not token:
+        return False
+    sess = DBSession.query.filter_by(token=token, revoked=False).first()
+    if not sess:
+        return False
+    
+    # Check expiration limits
+    if (time.time() - sess.created_at) > config.SESSION_TTL:
+        sess.revoked = True
+        db.session.commit()
+        return False
+        
+    # Enforce strict client IP pinning if configured
+    if config.SESSION_BIND_IP and client_ip and sess.ip != client_ip:
+        sess.revoked = True
+        db.session.commit()
+        return False
+        
+    sess.last_seen = time.time()
+    db.session.commit()
+    return True
+
+
+def _create_db_session(ip: str, username: str) -> str or None:
+    """Creates a tracking token bound securely into persistent tables."""
+    now = time.time()
+    # Expire out-of-date records dynamically to clear connection slots
+    expired = DBSession.query.filter(DBSession.revoked == False, (now - DBSession.created_at) > config.SESSION_TTL).all()
+    for s in expired:
+        s.revoked = True
+    if expired:
+        db.session.commit()
+
+    active_count = DBSession.query.filter_by(revoked=False).count()
+    if active_count >= config.MAX_SESSIONS:
+        return None
+
+    token = secrets.token_hex(config.TOKEN_BYTES)
+    new_sess = DBSession(token=token, ip=ip, username=username, created_at=now, last_seen=now, revoked=False)
+    db.session.add(new_sess)
+    db.session.commit()
+    return token
+
+
+def _db_block_ip(ip: str, duration: int):
+    """Saves firewall lockout parameters directly into PostgreSQL."""
+    now = time.time()
+    existing = DBBlockedIP.query.filter_by(ip=ip).first()
+    if existing:
+        existing.unblock_at = now + duration
+    else:
+        new_block = DBBlockedIP(ip=ip, blocked_at=now, unblock_at=now + duration)
+        db.session.add(new_block)
+    db.session.commit()
+
+
+# Build all target relational elements inside database environments
 with app.app_context():
     db.create_all()
 # ─────────────────────────────────────────────────────────────────────────────
+
+def require_session(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not _is_allowed_origin():
+            abort(403)
+
+        token = _session_token()
+        client = _client_ip()
+        bound_ip = client if config.SESSION_BIND_IP else None
+        if not _validate_db_session(token, client_ip=bound_ip):
+            log_security_event(Event.TOKEN_INVALID, ip=client)
+            abort(403)
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def _admin_password_hash() -> str:
+    if config.ADMIN_PASSWORD_HASH:
+        return config.ADMIN_PASSWORD_HASH
+    if config.DEBUG and config.ADMIN_PASSWORD:
+        return generate_password_hash(config.ADMIN_PASSWORD)
+    raise RuntimeError("Set DCOL_ADMIN_PASSWORD_HASH in Render configurations.")
+
 
 CORS(
     app,
@@ -222,9 +296,23 @@ def login():
         abort(403)
 
     client = _client_ip()
+    now = time.time()
+    
+    # 1. Enforce persistent DB-backed Blocklist Check
+    block = DBBlockedIP.query.filter_by(ip=client).first()
+    if block:
+        if now < block.unblock_at:
+            log_security_event(Event.RATE_LIMIT, ip=client, extra={"reason": "IP explicitly blocked in DB database cluster"})
+            return jsonify({"success": False, "message": "Too many attempts. Try again later."}), 429
+        else:
+            db.session.delete(block)
+            db.session.commit()
+
+    # 2. Check general rolling window allocations
     allowed, reason = is_allowed(client)
     if not allowed:
         log_security_event(Event.RATE_LIMIT, ip=client, extra={"reason": reason})
+        _db_block_ip(client, config.BLOCK_DURATION)
         return jsonify({"success": False, "message": "Too many attempts. Try again later."}), 429
 
     if not request.is_json:
@@ -241,6 +329,7 @@ def login():
         }
         log_security_event(event_map.get(threat_type, Event.LOGIN_FAILURE), ip=client, username=clean_user)
         block_ip(client)
+        _db_block_ip(client, config.BLOCK_DURATION)
         return jsonify({"success": False, "message": "Request blocked."}), 403
 
     is_valid = (
@@ -250,6 +339,8 @@ def login():
 
     if not is_valid:
         blocked_now, failed_count = record_failed_login(client)
+        if blocked_now:
+            _db_block_ip(client, config.LOCKOUT_SECONDS)
         event = Event.BRUTE_FORCE if blocked_now else Event.LOGIN_FAILURE
         log_security_event(
             event,
@@ -262,7 +353,7 @@ def login():
         return jsonify({"success": False, "message": "Invalid credentials."}), 401
 
     clear_failed_logins(client)
-    token = session_manager.create_session(ip=client, username=clean_user)
+    token = _create_db_session(ip=client, username=clean_user)
     if token is None:
         return jsonify({"success": False, "message": "Server session limit reached."}), 503
 
@@ -283,7 +374,11 @@ def login():
 @require_session
 def logout():
     token = _session_token()
-    session_manager.revoke(token)
+    sess = DBSession.query.filter_by(token=token).first()
+    if sess:
+        sess.revoked = True
+        db.session.commit()
+        
     log_security_event(Event.SESSION_REVOKED, ip=_client_ip())
     response = make_response(jsonify({"success": True}))
     response.delete_cookie(config.SESSION_COOKIE_NAME)
@@ -304,8 +399,7 @@ def get_logs():
             "status": log.status,
             "is_threat": log.is_threat
         } for log in logs])
-    except Exception as e:
-        print(f"[DB STATUS] Reading logs from fallback volatile buffer: {e}", flush=True)
+    except Exception:
         return jsonify(security_logger.recent(8))
 
 
@@ -323,21 +417,51 @@ def get_threat_logs():
             "status": log.status,
             "is_threat": log.is_threat
         } for log in logs])
-    except Exception as e:
-        print(f"[DB STATUS] Reading threat sequences from fallback volatile buffer: {e}", flush=True)
+    except Exception:
         return jsonify(security_logger.threats_only(20))
 
 
 @app.route("/api/blocked_ips", methods=["GET"])
 @require_session
 def get_blocked():
-    return jsonify(get_blocked_ips())
+    now = time.time()
+    try:
+        # Dynamically drop expired blocks on query
+        expired = DBBlockedIP.query.filter(DBBlockedIP.unblock_at <= now).all()
+        for b in expired:
+            db.session.delete(b)
+        if expired:
+            db.session.commit()
+
+        blocks = DBBlockedIP.query.all()
+        return jsonify({b.ip: max(0, int(b.unblock_at - now)) for b in blocks})
+    except Exception:
+        return jsonify(get_blocked_ips())
 
 
 @app.route("/api/active_sessions", methods=["GET"])
 @require_session
 def get_sessions():
-    return jsonify(session_manager.active_sessions())
+    now = time.time()
+    try:
+        # Dynamically expire out-of-date session limits on query
+        expired = DBSession.query.filter(DBSession.revoked == False, (now - DBSession.created_at) > config.SESSION_TTL).all()
+        for s in expired:
+            s.revoked = True
+        if expired:
+            db.session.commit()
+
+        sessions = DBSession.query.filter_by(revoked=False).all()
+        return jsonify([{
+            "token_prefix": s.token[:8] + "...",
+            "ip": s.ip,
+            "username": s.username,
+            "age_seconds": int(now - s.created_at),
+            "revoked": s.revoked,
+            "expired": (now - s.created_at) > config.SESSION_TTL
+        } for s in sessions])
+    except Exception:
+        return jsonify(session_manager.active_sessions())
 
 
 @app.route("/api/health", methods=["GET"])
