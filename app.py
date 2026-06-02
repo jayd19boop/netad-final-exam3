@@ -140,3 +140,8 @@ def _validate_db_session(token: str, client_ip: str = None) -> bool:
         return False
     
     if (time.time() - sess.created_at) > config.SESSION_TTL:
+        sess.revoked = True
+        db.session.commit()
+        return False
+        
+    if config
