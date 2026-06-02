@@ -36,6 +36,10 @@ DEBUG = _bool_env("DCOL_DEBUG", False)
 USE_RELOADER = _bool_env("DCOL_USE_RELOADER", False)
 SECRET_KEY = os.getenv("DCOL_SECRET_KEY")
 
+# Database Configuration
+# Render automatically injects DATABASE_URL when you attach a PostgreSQL instance
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 # CORS is only needed if you host the frontend on a separate origin.
 ALLOWED_ORIGINS = _csv_env(
     "DCOL_ALLOWED_ORIGINS",
