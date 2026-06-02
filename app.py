@@ -139,4 +139,4 @@ def _validate_db_session(token: str, client_ip: str = None) -> bool:
     if not sess:
         return False
     
-    if (time.time() - sess.created_at) > config
+    if (time.time() - sess.created_at) > config.SESSION_TTL:
