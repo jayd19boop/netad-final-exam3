@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: dcol-secure-monitor
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: DCOL_DEBUG
+        value: "false"
+      - key: DCOL_SESSION_COOKIE_SECURE
+        value: "true"
+      - key: DCOL_SESSION_BIND_IP
+        value: "false"
+      - key: DCOL_ADMIN_USER
+        value: admin
+      - key: DCOL_ADMIN_PASSWORD_HASH
+        sync: false
+      - key: DCOL_SECRET_KEY
+        generateValue: true
+      - key: DCOL_CAMERA_SOURCE
+        sync: false

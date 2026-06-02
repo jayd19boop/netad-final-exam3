@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DCOL Secure Monitor</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: Segoe UI, Tahoma, sans-serif; }
+        :root {
+            --bg: #111827; --panel: #1f2937; --panel-2: #0f172a; --text: #f9fafb;
+            --muted: #9ca3af; --line: #374151; --blue: #2563eb; --green: #22c55e;
+            --red: #ef4444; --yellow: #eab308; --orange: #f97316;
+        }
+        body { min-height: 100vh; background: var(--bg); color: var(--text); }
+        button, input { font: inherit; }
+        #login-container { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: var(--bg); z-index: 10; }
+        .login-box { width: 100%; max-width: 380px; padding: 32px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 20px 50px rgba(0,0,0,.35); }
+        .login-brand { font-size: 1.8rem; font-weight: 700; text-align: center; margin-bottom: 8px; }
+        .login-box p { text-align: center; color: var(--muted); margin-bottom: 22px; }
+        .input-group { margin-bottom: 14px; }
+        .input-group label { display: block; color: var(--muted); font-size: .82rem; margin-bottom: 6px; }
+        .input-group input { width: 100%; padding: 11px 12px; color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; }
+        .input-group input:focus { outline: 2px solid rgba(37,99,235,.35); border-color: var(--blue); }
+        #login-btn { width: 100%; padding: 12px; margin-top: 8px; border: 0; border-radius: 6px; background: var(--blue); color: white; font-weight: 700; cursor: pointer; }
+        #login-error { display: none; margin-top: 12px; color: var(--red); font-size: .85rem; text-align: center; }
+        #dashboard-container { display: none; min-height: 100vh; flex-direction: column; }
+        .navbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 24px; background: var(--panel); border-bottom: 1px solid var(--line); }
+        .brand { font-weight: 700; }
+        .nav-right { display: flex; align-items: center; gap: 12px; }
+        .status-badge { color: #86efac; border: 1px solid rgba(34,197,94,.35); background: rgba(34,197,94,.12); border-radius: 999px; padding: 5px 10px; font-size: .8rem; }
+        .logout { color: #fca5a5; background: transparent; border: 0; font-weight: 700; cursor: pointer; }
+        .main-content { padding: 24px; }
+        .header-row { display: flex; justify-content: space-between; gap: 16px; align-items: flex-end; margin-bottom: 18px; }
+        .header-row h1 { font-size: 1.45rem; }
+        .top-time { color: var(--muted); font-size: .86rem; }
+        .stats-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+        .stat-card, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+        .stat-card { padding: 14px; text-align: center; }
+        .stat-number { font-size: 1.7rem; font-weight: 800; }
+        .stat-label { color: var(--muted); font-size: .76rem; margin-top: 4px; }
+        .dashboard-grid { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 18px; align-items: start; }
+        .video-container { position: relative; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
+        #cctv-stream { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+        .video-badge { position: absolute; top: 14px; padding: 4px 10px; border-radius: 4px; font-size: .75rem; font-weight: 800; z-index: 2; }
+        .badge-live { left: 14px; background: var(--red); }
+        .badge-rec { right: 14px; background: var(--orange); }
+        .video-info { position: absolute; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; align-items: end; padding: 34px 16px 14px; background: linear-gradient(transparent, rgba(0,0,0,.82)); z-index: 2; }
+        .video-title p, .video-info small { color: #cbd5e1; }
+        .video-time { font: 700 1.1rem Consolas, monospace; text-align: right; }
+        .panel { padding: 14px; margin-bottom: 16px; }
+        .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-weight: 700; font-size: .9rem; }
+        .badge-count { color: #fecaca; border: 1px solid rgba(239,68,68,.35); background: rgba(239,68,68,.12); border-radius: 999px; padding: 2px 8px; font-size: .72rem; }
+        .log-item, .blocked-ip-item, .session-item { background: rgba(15,23,42,.72); border: 1px solid rgba(255,255,255,.06); border-left: 4px solid var(--line); border-radius: 6px; padding: 9px 10px; margin-bottom: 8px; font-size: .78rem; }
+        .log-item.threat { border-left-color: var(--red); }
+        .log-item.success { border-left-color: var(--green); }
+        .row { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+        .mono { font-family: Consolas, monospace; color: #cbd5e1; overflow-wrap: anywhere; }
+        .empty-msg { color: var(--muted); text-align: center; font-size: .82rem; padding: 12px 0; }
+        .red { color: var(--red); } .green { color: var(--green); } .yellow { color: var(--yellow); }
+        @media (max-width: 1000px) { .dashboard-grid { grid-template-columns: 1fr; } }
+        @media (max-width: 640px) { .stats-row { grid-template-columns: 1fr; } .navbar, .header-row { align-items: flex-start; flex-direction: column; } .main-content { padding: 16px; } }
+    </style>
+</head>
+<body>
+<div id="login-container">
+    <div class="login-box">
+        <div class="login-brand">DCOL</div>
+        <p>Secure Admin Terminal</p>
+        <div class="input-group">
+            <label for="username">Administrator ID</label>
+            <input type="text" id="username" autocomplete="username">
+        </div>
+        <div class="input-group">
+            <label for="password">Security Key</label>
+            <input type="password" id="password" autocomplete="current-password">
+        </div>
+        <button id="login-btn" type="button">Secure Login</button>
+        <div id="login-error"></div>
+    </div>
+</div>
+
+<div id="dashboard-container">
+    <nav class="navbar">
+        <div class="brand">DCOL Secure Monitor</div>
+        <div class="nav-right">
+            <div class="status-badge">System Protected</div>
+            <button class="logout" id="logout-btn" type="button">Log Out</button>
+        </div>
+    </nav>
+    <main class="main-content">
+        <div class="header-row">
+            <h1>Surveillance & Security</h1>
+            <div class="top-time" id="global-clock">Loading time...</div>
+        </div>
+        <div class="stats-row">
+            <div class="stat-card"><div class="stat-number red" id="stat-threats">0</div><div class="stat-label">Threats Detected</div></div>
+            <div class="stat-card"><div class="stat-number yellow" id="stat-blocked">0</div><div class="stat-label">IPs Blocked</div></div>
+            <div class="stat-card"><div class="stat-number green" id="stat-sessions">0</div><div class="stat-label">Active Sessions</div></div>
+        </div>
+        <div class="dashboard-grid">
+            <section>
+                <div class="video-container">
+                    <img id="cctv-stream" alt="Authenticated CCTV stream">
+                    <div class="video-badge badge-live">LIVE</div>
+                    <div class="video-badge badge-rec">REC</div>
+                    <div class="video-info">
+                        <div class="video-title"><h3>CCTV-1</h3><p>Main Entrance</p></div>
+                        <div><small>Current Time</small><div class="video-time" id="camera-clock">00:00:00</div></div>
+                    </div>
+                </div>
+                <div class="panel">
+                    <div class="panel-header"><span>Security Access Logs</span><span>Live Monitoring</span></div>
+                    <div id="security-logs-container"><p class="empty-msg">No recent activity.</p></div>
+                </div>
+            </section>
+            <section class="panel">
+                <div class="panel-header"><span>Blocked IPs</span><span id="blocked-count" class="badge-count">0</span></div>
+                <div id="blocked-ips-container"><p class="empty-msg">No blocked IPs.</p></div>
+            </section>
+            <section class="panel">
+                <div class="panel-header"><span>Active Sessions</span><span id="sessions-count" class="badge-count">0</span></div>
+                <div id="sessions-container"><p class="empty-msg">No active sessions.</p></div>
+            </section>
+        </div>
+    </main>
+</div>
+
+<script>
+    let pollTimer = null;
+
+    const $ = (id) => document.getElementById(id);
+
+    function addText(parent, tag, text, className = "") {
+        const element = document.createElement(tag);
+        element.textContent = text;
+        if (className) element.className = className;
+        parent.appendChild(element);
+        return element;
+    }
+
+    async function api(path, options = {}) {
+        return fetch(path, {
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+            ...options,
+        });
+    }
+
+    async function attemptLogin() {
+        const err = $("login-error");
+        err.style.display = "block";
+        err.style.color = "var(--muted)";
+        err.textContent = "Authenticating...";
+
+        try {
+            const res = await api("/api/login", {
+                method: "POST",
+                body: JSON.stringify({ username: $("username").value, password: $("password").value }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                err.style.color = "var(--red)";
+                err.textContent = data.message || "Login failed.";
+                return;
+            }
+
+            $("password").value = "";
+            $("login-container").style.display = "none";
+            $("dashboard-container").style.display = "flex";
+            $("cctv-stream").src = `/video_feed?ts=${Date.now()}`;
+            startPolling();
+        } catch {
+            err.style.color = "var(--red)";
+            err.textContent = "Cannot connect to the security server.";
+        }
+    }
+
+    async function logout() {
+        await api("/api/logout", { method: "POST", body: "{}" }).catch(() => {});
+        $("cctv-stream").src = "";
+        $("dashboard-container").style.display = "none";
+        $("login-container").style.display = "flex";
+        $("username").value = "";
+        if (pollTimer) clearInterval(pollTimer);
+    }
+
+    function startPolling() {
+        if (pollTimer) clearInterval(pollTimer);
+        fetchAll();
+        pollTimer = setInterval(fetchAll, 3000);
+    }
+
+    function restartStream() {
+        if ($("dashboard-container").style.display !== "flex") return;
+        $("cctv-stream").src = `/video_feed?ts=${Date.now()}`;
+    }
+
+    async function fetchAll() {
+        await Promise.allSettled([fetchLogs(), fetchBlockedIPs(), fetchSessions()]);
+    }
+
+    async function fetchLogs() {
+        const res = await api("/api/security_logs");
+        if (!res.ok) return;
+        const logs = await res.json();
+        const box = $("security-logs-container");
+        box.replaceChildren();
+        if (!logs.length) {
+            addText(box, "p", "No recent activity.", "empty-msg");
+            $("stat-threats").textContent = "0";
+            return;
+        }
+        let threats = 0;
+        for (const log of logs) {
+            if (log.is_threat) threats++;
+            const item = document.createElement("div");
+            item.className = `log-item ${log.is_threat ? "threat" : log.status === "Authorized Access" ? "success" : ""}`;
+            const row = document.createElement("div");
+            row.className = "row";
+            addText(row, "strong", log.status || log.event || "Event");
+            addText(row, "span", log.time || "");
+            item.appendChild(row);
+            addText(item, "div", `User: ${log.username || "-"} | IP: ${log.ip || "-"}`, "mono");
+            box.appendChild(item);
+        }
+        $("stat-threats").textContent = String(threats);
+    }
+
+    async function fetchBlockedIPs() {
+        const res = await api("/api/blocked_ips");
+        if (!res.ok) return;
+        const blocked = await res.json();
+        const entries = Object.entries(blocked);
+        const box = $("blocked-ips-container");
+        box.replaceChildren();
+        $("blocked-count").textContent = String(entries.length);
+        $("stat-blocked").textContent = String(entries.length);
+        if (!entries.length) return addText(box, "p", "No blocked IPs.", "empty-msg");
+        for (const [ip, seconds] of entries) {
+            const item = document.createElement("div");
+            item.className = "blocked-ip-item";
+            addText(item, "div", ip, "mono");
+            addText(item, "div", `${seconds}s remaining`);
+            box.appendChild(item);
+        }
+    }
+
+    async function fetchSessions() {
+        const res = await api("/api/active_sessions");
+        if (!res.ok) return;
+        const sessions = await res.json();
+        const box = $("sessions-container");
+        box.replaceChildren();
+        $("sessions-count").textContent = String(sessions.length);
+        $("stat-sessions").textContent = String(sessions.length);
+        if (!sessions.length) return addText(box, "p", "No active sessions.", "empty-msg");
+        for (const session of sessions) {
+            const item = document.createElement("div");
+            item.className = "session-item";
+            addText(item, "div", `User: ${session.username}`, "mono");
+            addText(item, "div", `Age: ${session.age_seconds}s | Token: ${session.token_prefix}`, "mono");
+            box.appendChild(item);
+        }
+    }
+
+    function updateClock() {
+        const now = new Date();
+        $("global-clock").textContent = now.toLocaleString();
+        $("camera-clock").textContent = now.toLocaleTimeString();
+    }
+
+    $("login-btn").addEventListener("click", attemptLogin);
+    $("logout-btn").addEventListener("click", logout);
+    $("cctv-stream").addEventListener("error", () => {
+        setTimeout(restartStream, 2000);
+    });
+    $("password").addEventListener("keydown", (event) => {
+        if (event.key === "Enter") attemptLogin();
+    });
+    setInterval(updateClock, 1000);
+    updateClock();
+</script>
+</body>
+</html>
