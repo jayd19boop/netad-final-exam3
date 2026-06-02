@@ -1,4 +1,4 @@
-"""DCOL secure surveillance backend for Render deployment."""
+"""DCOL secure surveillance backend with PostgreSQL database integration."""
 
 import os
 import threading
@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 import cv2
 from flask import Flask, Response, abort, jsonify, make_response, request, send_from_directory
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -59,7 +60,7 @@ def require_session(view):
         client = _client_ip()
         bound_ip = client if config.SESSION_BIND_IP else None
         if not session_manager.validate(token, ip=bound_ip):
-            security_logger.log(Event.TOKEN_INVALID, ip=client)
+            log_security_event(Event.TOKEN_INVALID, ip=client)
             abort(403)
         return view(*args, **kwargs)
 
@@ -81,6 +82,61 @@ def _admin_password_hash() -> str:
 app = Flask(__name__, static_folder=None)
 app.secret_key = config.SECRET_KEY or os.urandom(32)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# ── POSTGRESQL CONFIGURATION & DATABASE MODELS ───────────────────────────────
+db_url = config.DATABASE_URL
+if db_url:
+    # Safely convert old dialect strings to SQLAlchemy 1.4+ standards
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+else:
+    db_url = "sqlite:///:memory:"
+
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(app)
+
+
+class DBLog(db.Model):
+    """PostgreSQL Schema mirroring audit events for persistent collection."""
+    __tablename__ = "security_events"
+    id = db.Column(db.Integer, primary_key=True)
+    time = db.Column(db.String(20), nullable=False)
+    timestamp = db.Column(db.String(50), nullable=False)
+    event = db.Column(db.String(50), nullable=False)
+    ip = db.Column(db.String(45), nullable=False)
+    username = db.Column(db.String(50), default="")
+    status = db.Column(db.String(100), nullable=False)
+    is_threat = db.Column(db.Boolean, default=False)
+
+
+def log_security_event(event_type: str, ip: str, username: str = None, extra: dict = None):
+    """Dispatches logging events directly to file structures and PostgreSQL."""
+    # Write to local memory buffers/files first
+    entry = security_logger.log(event_type, ip, username=username, extra=extra)
+    
+    # Mirror persistently to database layer
+    try:
+        db_entry = DBLog(
+            time=entry.get("time", ""),
+            timestamp=entry.get("timestamp", ""),
+            event=entry.get("event", ""),
+            ip=entry.get("ip", ""),
+            username=entry.get("username", ""),
+            status=entry.get("status", ""),
+            is_threat=entry.get("is_threat", False)
+        )
+        db.session.add(db_entry)
+        db.session.commit()
+    except Exception as e:
+        print(f"[DATABASE ERROR] Logging mirroring connection dropped: {e}", flush=True)
+        db.session.rollback()
+
+
+# Automatically initialize tables inside the database context during instantiation
+with app.app_context():
+    db.create_all()
+# ─────────────────────────────────────────────────────────────────────────────
 
 CORS(
     app,
@@ -152,7 +208,7 @@ def generate_frames():
 @require_session
 def video_feed():
     client = _client_ip()
-    security_logger.log(Event.STREAM_ACCESS, ip=client)
+    log_security_event(Event.STREAM_ACCESS, ip=client)
     return Response(
         generate_frames(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
@@ -168,7 +224,7 @@ def login():
     client = _client_ip()
     allowed, reason = is_allowed(client)
     if not allowed:
-        security_logger.log(Event.RATE_LIMIT, ip=client, extra={"reason": reason})
+        log_security_event(Event.RATE_LIMIT, ip=client, extra={"reason": reason})
         return jsonify({"success": False, "message": "Too many attempts. Try again later."}), 429
 
     if not request.is_json:
@@ -183,7 +239,7 @@ def login():
             "XSS_ATTEMPT": Event.XSS_ATTEMPT,
             "COMMAND_INJECTION": Event.COMMAND_INJECTION,
         }
-        security_logger.log(event_map.get(threat_type, Event.LOGIN_FAILURE), ip=client, username=clean_user)
+        log_security_event(event_map.get(threat_type, Event.LOGIN_FAILURE), ip=client, username=clean_user)
         block_ip(client)
         return jsonify({"success": False, "message": "Request blocked."}), 403
 
@@ -195,7 +251,7 @@ def login():
     if not is_valid:
         blocked_now, failed_count = record_failed_login(client)
         event = Event.BRUTE_FORCE if blocked_now else Event.LOGIN_FAILURE
-        security_logger.log(
+        log_security_event(
             event,
             ip=client,
             username=clean_user,
@@ -210,7 +266,7 @@ def login():
     if token is None:
         return jsonify({"success": False, "message": "Server session limit reached."}), 503
 
-    security_logger.log(Event.LOGIN_SUCCESS, ip=client, username=clean_user)
+    log_security_event(Event.LOGIN_SUCCESS, ip=client, username=clean_user)
     response = make_response(jsonify({"success": True, "message": "Authorized Access"}))
     response.set_cookie(
         config.SESSION_COOKIE_NAME,
@@ -228,7 +284,7 @@ def login():
 def logout():
     token = _session_token()
     session_manager.revoke(token)
-    security_logger.log(Event.SESSION_REVOKED, ip=_client_ip())
+    log_security_event(Event.SESSION_REVOKED, ip=_client_ip())
     response = make_response(jsonify({"success": True}))
     response.delete_cookie(config.SESSION_COOKIE_NAME)
     return response
@@ -237,13 +293,39 @@ def logout():
 @app.route("/api/security_logs", methods=["GET"])
 @require_session
 def get_logs():
-    return jsonify(security_logger.recent(8))
+    try:
+        logs = DBLog.query.order_by(DBLog.id.desc()).limit(8).all()
+        return jsonify([{
+            "time": log.time,
+            "timestamp": log.timestamp,
+            "event": log.event,
+            "ip": log.ip,
+            "username": log.username,
+            "status": log.status,
+            "is_threat": log.is_threat
+        } for log in logs])
+    except Exception as e:
+        print(f"[DB STATUS] Reading logs from fallback volatile buffer: {e}", flush=True)
+        return jsonify(security_logger.recent(8))
 
 
 @app.route("/api/threat_logs", methods=["GET"])
 @require_session
 def get_threat_logs():
-    return jsonify(security_logger.threats_only(20))
+    try:
+        logs = DBLog.query.filter_by(is_threat=True).order_by(DBLog.id.desc()).limit(20).all()
+        return jsonify([{
+            "time": log.time,
+            "timestamp": log.timestamp,
+            "event": log.event,
+            "ip": log.ip,
+            "username": log.username,
+            "status": log.status,
+            "is_threat": log.is_threat
+        } for log in logs])
+    except Exception as e:
+        print(f"[DB STATUS] Reading threat sequences from fallback volatile buffer: {e}", flush=True)
+        return jsonify(security_logger.threats_only(20))
 
 
 @app.route("/api/blocked_ips", methods=["GET"])
@@ -264,7 +346,20 @@ def health():
     parsed = urlparse(source)
     source_type = "remote" if parsed.scheme else "local"
     cap = _get_camera()
-    return jsonify({"status": "ok", "camera": cap.isOpened(), "source": source_type})
+    
+    db_connected = False
+    try:
+        db.session.execute(db.text("SELECT 1"))
+        db_connected = True
+    except Exception:
+        pass
+
+    return jsonify({
+        "status": "ok", 
+        "camera": cap.isOpened(), 
+        "source": source_type,
+        "database": db_connected
+    })
 
 
 if __name__ == "__main__":
