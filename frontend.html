@@ -127,6 +127,8 @@
 
 <script>
     let pollTimer = null;
+    let localSessions = [];
+    let localBlocked = [];
 
     const $ = (id) => document.getElementById(id);
 
@@ -144,6 +146,25 @@
             headers: { "Content-Type": "application/json", ...(options.headers || {}) },
             ...options,
         });
+    }
+
+    // Check if the user already has a valid cookie when loading the page
+    async function checkExistingAuth() {
+        try {
+            const res = await api("/api/active_sessions");
+            if (res.ok) {
+                showDashboard();
+            }
+        } catch (e) {
+            // No valid session, stay on login screen
+        }
+    }
+
+    function showDashboard() {
+        $("login-container").style.display = "none";
+        $("dashboard-container").style.display = "flex";
+        $("cctv-stream").src = `/video_feed?ts=${Date.now()}`;
+        startPolling();
     }
 
     async function attemptLogin() {
@@ -165,10 +186,7 @@
             }
 
             $("password").value = "";
-            $("login-container").style.display = "none";
-            $("dashboard-container").style.display = "flex";
-            $("cctv-stream").src = `/video_feed?ts=${Date.now()}`;
-            startPolling();
+            showDashboard();
         } catch {
             err.style.color = "var(--red)";
             err.textContent = "Cannot connect to the security server.";
@@ -230,17 +248,22 @@
         const res = await api("/api/blocked_ips");
         if (!res.ok) return;
         const blocked = await res.json();
-        const entries = Object.entries(blocked);
+        localBlocked = Object.entries(blocked).map(([ip, seconds]) => ({ ip, seconds: parseInt(seconds) }));
+        renderBlockedIPs();
+    }
+
+    function renderBlockedIPs() {
         const box = $("blocked-ips-container");
         box.replaceChildren();
-        $("blocked-count").textContent = String(entries.length);
-        $("stat-blocked").textContent = String(entries.length);
-        if (!entries.length) return addText(box, "p", "No blocked IPs.", "empty-msg");
-        for (const [ip, seconds] of entries) {
+        $("blocked-count").textContent = String(localBlocked.length);
+        $("stat-blocked").textContent = String(localBlocked.length);
+        if (!localBlocked.length) return addText(box, "p", "No blocked IPs.", "empty-msg");
+        
+        for (const itemData of localBlocked) {
             const item = document.createElement("div");
             item.className = "blocked-ip-item";
-            addText(item, "div", ip, "mono");
-            addText(item, "div", `${seconds}s remaining`);
+            addText(item, "div", itemData.ip, "mono");
+            addText(item, "div", `${itemData.seconds}s remaining`);
             box.appendChild(item);
         }
     }
@@ -248,13 +271,18 @@
     async function fetchSessions() {
         const res = await api("/api/active_sessions");
         if (!res.ok) return;
-        const sessions = await res.json();
+        localSessions = await res.json();
+        renderSessions();
+    }
+
+    function renderSessions() {
         const box = $("sessions-container");
         box.replaceChildren();
-        $("sessions-count").textContent = String(sessions.length);
-        $("stat-sessions").textContent = String(sessions.length);
-        if (!sessions.length) return addText(box, "p", "No active sessions.", "empty-msg");
-        for (const session of sessions) {
+        $("sessions-count").textContent = String(localSessions.length);
+        $("stat-sessions").textContent = String(localSessions.length);
+        if (!localSessions.length) return addText(box, "p", "No active sessions.", "empty-msg");
+        
+        for (const session of localSessions) {
             const item = document.createElement("div");
             item.className = "session-item";
             addText(item, "div", `User: ${session.username}`, "mono");
@@ -263,10 +291,25 @@
         }
     }
 
-    function updateClock() {
+    // Handles true 1-second real-time ticking for the interface
+    function updateClockAndTimers() {
         const now = new Date();
         $("global-clock").textContent = now.toLocaleString();
         $("camera-clock").textContent = now.toLocaleTimeString();
+
+        if ($("dashboard-container").style.display === "flex") {
+            // Tick down blocked IP countdown timers
+            if (localBlocked.length > 0) {
+                localBlocked = localBlocked.map(b => ({ ...b, seconds: b.seconds - 1 })).filter(b => b.seconds > 0);
+                renderBlockedIPs();
+            }
+
+            // Tick up active session duration counters
+            if (localSessions.length > 0) {
+                localSessions = localSessions.map(s => ({ ...s, age_seconds: s.age_seconds + 1 }));
+                renderSessions();
+            }
+        }
     }
 
     $("login-btn").addEventListener("click", attemptLogin);
@@ -277,8 +320,11 @@
     $("password").addEventListener("keydown", (event) => {
         if (event.key === "Enter") attemptLogin();
     });
-    setInterval(updateClock, 1000);
-    updateClock();
+
+    // Run auth check on initialization
+    document.addEventListener("DOMContentLoaded", checkExistingAuth);
+    setInterval(updateClockAndTimers, 1000);
+    updateClockAndTimers();
 </script>
 </body>
 </html>
